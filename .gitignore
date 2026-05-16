@@ -1,0 +1,5 @@
+# Runtime files
+acceptor.runtime*.log
+
+# User-specific calibration
+acceptor.config.json
