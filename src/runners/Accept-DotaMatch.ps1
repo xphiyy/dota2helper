@@ -1,28 +1,44 @@
 ﻿param(
-    [int]$PollMs = 450,
-    [int]$StableHits = 3,
-    [int]$CooldownSeconds = 15,
+    [int]$PollMs = -1,
+    [int]$StableHits = -1,
+    [int]$CooldownSeconds = -1,
     [int]$DurationSeconds = 0,
     [switch]$Calibrate,
     [switch]$StopAfterAccept,
     [switch]$NoClick,
     [switch]$AllowAnyForeground,
     [switch]$VerboseDetection,
+    [string]$ToolConfigPath = '',
+    [string]$TargetConfigPath = '',
     [string]$LogPath = ''
 )
 
-$configPath = Join-Path $PSScriptRoot 'acceptor.config.json'
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$localDir = Join-Path $projectRoot 'local'
+[void][System.IO.Directory]::CreateDirectory($localDir)
+$configPath = Join-Path $localDir 'acceptor.config.json'
+$defaultToolConfigPath = Join-Path $projectRoot 'config\tools\auto-accept.tool.json'
+$defaultTargetConfigPath = Join-Path $projectRoot 'config\targets\dota-default.targets.json'
 
 function Write-Status {
     param([string]$Message)
     Write-Host $Message
     if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
+        $stream = $null
+        $writer = $null
         try {
             $line = "[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $Message
-            Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+            [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $LogPath))
+            $stream = [System.IO.File]::Open($LogPath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+            $writer = New-Object System.IO.StreamWriter($stream, [System.Text.Encoding]::UTF8)
+            $writer.WriteLine($line)
         }
         catch {
             # Logging should never stop the detector.
+        }
+        finally {
+            if ($null -ne $writer) { $writer.Dispose() }
+            elseif ($null -ne $stream) { $stream.Dispose() }
         }
     }
 }
@@ -51,6 +67,40 @@ public static class Win32AcceptTool
 }
 "@
 
+function Get-JsonConfig {
+    param(
+        [string]$Path,
+        [string]$Label
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        Write-Status "WARNING: $Label config not found: $Path"
+        return $null
+    }
+
+    try {
+        Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    }
+    catch {
+        Write-Status "WARNING: Could not read $Label config: $Path"
+        return $null
+    }
+}
+
+function Get-ConfigValue {
+    param(
+        [object]$Object,
+        [string]$Name,
+        [object]$Default
+    )
+
+    if ($null -ne $Object -and $Object.PSObject.Properties.Name -contains $Name -and $null -ne $Object.$Name) {
+        return $Object.$Name
+    }
+
+    return $Default
+}
+
 function Get-ForegroundTitle {
     $buffer = New-Object System.Text.StringBuilder 512
     $hwnd = [Win32AcceptTool]::GetForegroundWindow()
@@ -64,20 +114,29 @@ function Test-DotaForeground {
     }
 
     $title = Get-ForegroundTitle
-    return $title -match 'Dota\s*2'
+    return $title -match $script:foregroundTitlePattern
 }
 
 function New-CenterScanRegion {
     $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-    $scale = [Math]::Max(0.75, [Math]::Min(1.6, $screen.Height / 1080.0))
+    $scan = Get-ConfigValue $script:acceptTarget 'scanRegion' $null
 
-    $width = [int][Math]::Min($screen.Width * 0.42, 520 * $scale)
-    $height = [int](150 * $scale)
+    $minScale = [double](Get-ConfigValue $scan 'minScale' 0.75)
+    $maxScale = [double](Get-ConfigValue $scan 'maxScale' 1.6)
+    $widthRatio = [double](Get-ConfigValue $scan 'widthRatio' 0.42)
+    $maxWidthAt1080p = [double](Get-ConfigValue $scan 'maxWidthAt1080p' 520)
+    $heightAt1080p = [double](Get-ConfigValue $scan 'heightAt1080p' 150)
+    $yOffsetAt1080p = [double](Get-ConfigValue $scan 'yOffsetAt1080p' -35)
+
+    $scale = [Math]::Max($minScale, [Math]::Min($maxScale, $screen.Height / 1080.0))
+
+    $width = [int][Math]::Min($screen.Width * $widthRatio, $maxWidthAt1080p * $scale)
+    $height = [int]($heightAt1080p * $scale)
     $x = [int](($screen.Width - $width) / 2)
 
     # popup_accept_match.vcss_c places the 320x64 accept button centered,
     # roughly below the screen center inside a 768px-wide popup panel.
-    $y = [int](($screen.Height / 2) - (35 * $scale))
+    $y = [int](($screen.Height / 2) + ($yOffsetAt1080p * $scale))
 
     [System.Drawing.Rectangle]::new($x, $y, $width, $height)
 }
@@ -89,9 +148,31 @@ function Get-AcceptButtonCandidate {
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
 
     try {
-        $graphics.CopyFromScreen($Region.Location, [System.Drawing.Point]::Empty, $Region.Size)
+        try {
+            $graphics.CopyFromScreen($Region.Location, [System.Drawing.Point]::Empty, $Region.Size)
+        }
+        catch {
+            if ($VerboseDetection) {
+                Write-Status "capture failed: $($_.Exception.Message)"
+            }
+            return $null
+        }
 
-        $step = 4
+        $visualRule = Get-ConfigValue $script:acceptTarget 'visualRule' $null
+        $color = Get-ConfigValue $visualRule 'color' $null
+        $step = [int](Get-ConfigValue $script:acceptTarget 'sampleStep' 4)
+        $minHits = [int](Get-ConfigValue $visualRule 'minHits' 120)
+        $minClusterWidth = [int](Get-ConfigValue $visualRule 'minClusterWidth' 150)
+        $minClusterHeight = [int](Get-ConfigValue $visualRule 'minClusterHeight' 24)
+        $rMin = [int](Get-ConfigValue $color 'rMin' 25)
+        $rMax = [int](Get-ConfigValue $color 'rMax' 115)
+        $gMin = [int](Get-ConfigValue $color 'gMin' 70)
+        $gMax = [int](Get-ConfigValue $color 'gMax' 230)
+        $bMin = [int](Get-ConfigValue $color 'bMin' 45)
+        $bMax = [int](Get-ConfigValue $color 'bMax' 165)
+        $gOverR = [double](Get-ConfigValue $color 'gOverR' 1.2)
+        $gOverB = [double](Get-ConfigValue $color 'gOverB' 0.95)
+
         $hits = 0
         $minX = $Region.Width
         $minY = $Region.Height
@@ -105,11 +186,11 @@ function Get-AcceptButtonCandidate {
                 # Derived from popup_accept_match.vcss_c:
                 # #Button0 uses green shades around #45715b and #48d07d.
                 $isAcceptGreen =
-                    $pixel.R -ge 25 -and $pixel.R -le 115 -and
-                    $pixel.G -ge 70 -and $pixel.G -le 230 -and
-                    $pixel.B -ge 45 -and $pixel.B -le 165 -and
-                    $pixel.G -gt ($pixel.R * 1.20) -and
-                    $pixel.G -gt ($pixel.B * 0.95)
+                    $pixel.R -ge $rMin -and $pixel.R -le $rMax -and
+                    $pixel.G -ge $gMin -and $pixel.G -le $gMax -and
+                    $pixel.B -ge $bMin -and $pixel.B -le $bMax -and
+                    $pixel.G -gt ($pixel.R * $gOverR) -and
+                    $pixel.G -gt ($pixel.B * $gOverB)
 
                 if ($isAcceptGreen) {
                     $hits++
@@ -121,14 +202,14 @@ function Get-AcceptButtonCandidate {
             }
         }
 
-        if ($hits -lt 120) {
+        if ($hits -lt $minHits) {
             return $null
         }
 
         $clusterWidth = $maxX - $minX
         $clusterHeight = $maxY - $minY
 
-        if ($clusterWidth -lt 150 -or $clusterHeight -lt 24) {
+        if ($clusterWidth -lt $minClusterWidth -or $clusterHeight -lt $minClusterHeight) {
             return $null
         }
 
@@ -193,6 +274,34 @@ function Get-Calibration {
     }
 }
 
+if ([string]::IsNullOrWhiteSpace($ToolConfigPath)) {
+    $ToolConfigPath = $defaultToolConfigPath
+}
+if ([string]::IsNullOrWhiteSpace($TargetConfigPath)) {
+    $TargetConfigPath = $defaultTargetConfigPath
+}
+
+$toolConfig = Get-JsonConfig -Path $ToolConfigPath -Label 'tool'
+$targetConfig = Get-JsonConfig -Path $TargetConfigPath -Label 'target'
+$defaultModeName = [string](Get-ConfigValue $toolConfig 'defaultMode' 'ready')
+$defaultMode = $null
+if ($null -ne $toolConfig -and $null -ne $toolConfig.modes -and $toolConfig.modes.PSObject.Properties.Name -contains $defaultModeName) {
+    $defaultMode = $toolConfig.modes.$defaultModeName
+}
+
+if ($PollMs -lt 0) { $PollMs = [int](Get-ConfigValue $defaultMode 'pollMs' 450) }
+if ($StableHits -lt 0) { $StableHits = [int](Get-ConfigValue $defaultMode 'stableHits' 3) }
+if ($CooldownSeconds -lt 0) { $CooldownSeconds = [int](Get-ConfigValue $defaultMode 'cooldownSeconds' 15) }
+
+$script:foregroundTitlePattern = [string](Get-ConfigValue $targetConfig 'foregroundTitlePattern' 'Dota\s*2')
+$script:acceptTarget = $null
+if ($null -ne $targetConfig -and $null -ne $targetConfig.targets -and $null -ne $targetConfig.targets.accept_button) {
+    $script:acceptTarget = $targetConfig.targets.accept_button
+}
+if ($null -eq $script:acceptTarget) {
+    $script:acceptTarget = [pscustomobject]@{}
+}
+
 $scanRegion = New-CenterScanRegion
 
 if ($Calibrate) {
@@ -229,6 +338,8 @@ $lastClick = [DateTime]::MinValue
 $startedAt = Get-Date
 
 Write-Status "Dota match acceptor running. Region=$($scanRegion.X),$($scanRegion.Y),$($scanRegion.Width)x$($scanRegion.Height), PollMs=$PollMs, StableHits=$StableHits"
+Write-Status "Tool config: $ToolConfigPath"
+Write-Status "Target config: $TargetConfigPath"
 if ($null -ne $calibratedClick) {
     Write-Status "Using calibrated click coordinate: $($calibratedClick.X),$($calibratedClick.Y)"
 }

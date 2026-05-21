@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "tool": "CreateLobby",
+  "displayName": "Create Lobby",
+  "runner": "Invoke-DotaSequence.ps1",
+  "description": "Create a configured custom game lobby using a recorded local operation sequence.",
+  "defaultMode": "run",
+  "inputs": {
+    "ModGameName": "DOTA2 IM"
+  },
+  "sequenceTemplate": {
+    "tool": "CreateLobby",
+    "modGameName": "{{ModGameName}}",
+    "screenWidth": 0,
+    "screenHeight": 0,
+    "notes": "Record real operations with Operation Recorder. Each important step should have prerequisites that verify the current page before the action runs.",
+    "flow": [
+      "assume dashboard activated",
+      "click ARCADE",
+      "click LOBBY LIST",
+      "click CREATE CUSTOM LOBBY",
+      "set Game Mod: {{ModGameName}}",
+      "set Server Location",
+      "click CREATE"
+    ],
+    "steps": [
+      {
+        "name": "Click ARCADE",
+        "action": "click",
+        "x": 0,
+        "y": 0,
+        "prerequisites": [
+          {
+            "name": "Dashboard is active",
+            "action": "verifyColorCluster",
+            "region": { "x": 0, "y": 0, "width": 300, "height": 160 },
+            "color": { "r": 255, "g": 255, "b": 255 },
+            "tolerance": 24,
+            "minHits": 20,
+            "sampleStep": 4,
+            "timeoutMs": 3000
+          }
+        ]
+      },
+      {
+        "name": "Click LOBBY LIST",
+        "action": "click",
+        "x": 0,
+        "y": 0,
+        "prerequisites": [
+          {
+            "name": "Arcade page is visible",
+            "action": "verifyColorCluster",
+            "region": { "x": 0, "y": 0, "width": 300, "height": 160 },
+            "color": { "r": 255, "g": 255, "b": 255 },
+            "tolerance": 24,
+            "minHits": 20,
+            "sampleStep": 4,
+            "timeoutMs": 3000
+          }
+        ]
+      },
+      {
+        "name": "Click CREATE CUSTOM LOBBY",
+        "action": "click",
+        "x": 0,
+        "y": 0,
+        "prerequisites": [
+          {
+            "name": "Lobby list is visible",
+            "action": "verifyColorCluster",
+            "region": { "x": 0, "y": 0, "width": 300, "height": 160 },
+            "color": { "r": 255, "g": 255, "b": 255 },
+            "tolerance": 24,
+            "minHits": 20,
+            "sampleStep": 4,
+            "timeoutMs": 3000
+          }
+        ]
+      },
+      {
+        "name": "Set Game Mod",
+        "action": "subflow",
+        "flow": [
+          {
+            "name": "Open Game Mod list",
+            "action": "click",
+            "x": 0,
+            "y": 0,
+            "prerequisites": [
+              {
+                "name": "Create custom lobby page is visible",
+                "action": "verifyColorCluster",
+                "region": { "x": 0, "y": 0, "width": 300, "height": 160 },
+                "color": { "r": 255, "g": 255, "b": 255 },
+                "tolerance": 24,
+                "minHits": 20,
+                "sampleStep": 4,
+                "timeoutMs": 3000
+              }
+            ]
+          },
+          {
+            "name": "Select Game Mod: {{ModGameName}}",
+            "action": "click",
+            "x": 0,
+            "y": 0
+          },
+          {
+            "name": "Open Server Location list",
+            "action": "click",
+            "x": 0,
+            "y": 0
+          },
+          {
+            "name": "Select Server Location",
+            "action": "click",
+            "x": 0,
+            "y": 0
+          }
+        ]
+      },
+      {
+        "name": "Click CREATE",
+        "action": "click",
+        "x": 0,
+        "y": 0,
+        "prerequisites": [
+          {
+            "name": "Game mode configuration is ready",
+            "action": "verifyColorCluster",
+            "region": { "x": 0, "y": 0, "width": 300, "height": 160 },
+            "color": { "r": 255, "g": 255, "b": 255 },
+            "tolerance": 24,
+            "minHits": 20,
+            "sampleStep": 4,
+            "timeoutMs": 3000
+          }
+        ]
+      }
+    ]
+  }
+}

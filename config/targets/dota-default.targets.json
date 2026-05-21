@@ -1,0 +1,39 @@
+{
+  "source": "dota-default",
+  "foregroundTitlePattern": "Dota\\s*2",
+  "targets": {
+    "accept_button": {
+      "type": "visualRule",
+      "description": "Dota 2 match-found Accept button derived from popup_accept_match.vcss_c #Button0.",
+      "scanRegion": {
+        "strategy": "centerScale",
+        "widthRatio": 0.42,
+        "maxWidthAt1080p": 520,
+        "heightAt1080p": 150,
+        "yOffsetAt1080p": -35,
+        "minScale": 0.75,
+        "maxScale": 1.6
+      },
+      "sampleStep": 4,
+      "visualRule": {
+        "kind": "colorCluster",
+        "minHits": 120,
+        "minClusterWidth": 150,
+        "minClusterHeight": 24,
+        "color": {
+          "rMin": 25,
+          "rMax": 115,
+          "gMin": 70,
+          "gMax": 230,
+          "bMin": 45,
+          "bMax": 165,
+          "gOverR": 1.2,
+          "gOverB": 0.95
+        }
+      },
+      "click": {
+        "strategy": "localCalibrationThenDetectedCenter"
+      }
+    }
+  }
+}

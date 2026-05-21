@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "tool": "AutoAccept",
+  "displayName": "Auto Accept",
+  "runner": "Accept-DotaMatch.ps1",
+  "description": "Observe the Dota 2 match-found popup, verify the Accept button, then click or report the target.",
+  "defaultMode": "ready",
+  "inputs": {},
+  "modes": {
+    "ready": {
+      "displayName": "Ready: click once",
+      "pollMs": 450,
+      "stableHits": 3,
+      "cooldownSeconds": 15,
+      "noClick": false,
+      "verboseDetection": false,
+      "allowAnyForeground": false,
+      "stopAfterAccept": false
+    },
+    "test": {
+      "displayName": "Test: detect only",
+      "pollMs": 450,
+      "stableHits": 3,
+      "cooldownSeconds": 15,
+      "noClick": true,
+      "verboseDetection": true,
+      "allowAnyForeground": false,
+      "stopAfterAccept": false
+    },
+    "fast": {
+      "displayName": "Fast: lower delay",
+      "pollMs": 200,
+      "stableHits": 2,
+      "cooldownSeconds": 10,
+      "noClick": false,
+      "verboseDetection": false,
+      "allowAnyForeground": false,
+      "stopAfterAccept": false
+    }
+  },
+  "sequenceTemplate": {
+    "tool": "AutoAccept",
+    "screenWidth": 0,
+    "screenHeight": 0,
+    "notes": "Auto Accept is an observe-loop tool. It repeatedly verifies the Accept button target, then clicks or reports depending on mode.",
+    "flow": [
+      "verify Dota foreground unless allowAnyForeground",
+      "observe accept button visual rule",
+      "if verified and noClick=false, click Accept button",
+      "if verified and noClick=true, report detection"
+    ],
+    "steps": [
+      {
+        "name": "Observe Accept button",
+        "action": "verifyColorCluster",
+        "target": "accept_button",
+        "repeat": true,
+        "prerequisites": [
+          {
+            "name": "Dota foreground is active",
+            "action": "foregroundTitle",
+            "pattern": "Dota\\s*2",
+            "skipWhen": "allowAnyForeground"
+          }
+        ]
+      },
+      {
+        "name": "Click Accept button",
+        "action": "click",
+        "target": "accept_button",
+        "when": "verified && !noClick"
+      },
+      {
+        "name": "Report Accept detection",
+        "action": "log",
+        "when": "verified && noClick"
+      }
+    ]
+  }
+}

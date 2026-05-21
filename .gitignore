@@ -1,5 +1,7 @@
-# Runtime files
-acceptor.runtime*.log
+# Local generated state
+local/
 
-# User-specific calibration
+# Backward-compatible legacy locations
+acceptor.runtime*.log
 acceptor.config.json
+create-lobby.config.json
