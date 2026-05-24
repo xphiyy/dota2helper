@@ -60,6 +60,9 @@ public static class Win32AcceptTool
     public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
 
     [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll")]
     public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
 
     public const uint LEFTDOWN = 0x0002;
@@ -108,8 +111,28 @@ function Get-ForegroundTitle {
     $buffer.ToString()
 }
 
+function Get-ForegroundProcessName {
+    $hwnd = [Win32AcceptTool]::GetForegroundWindow()
+    if ($hwnd -eq [IntPtr]::Zero) { return '' }
+
+    $foregroundPid = [uint32]0
+    [void][Win32AcceptTool]::GetWindowThreadProcessId($hwnd, [ref]$foregroundPid)
+    if ($foregroundPid -eq 0) { return '' }
+
+    try {
+        return ([System.Diagnostics.Process]::GetProcessById([int]$foregroundPid)).ProcessName
+    }
+    catch {
+        return ''
+    }
+}
+
 function Test-DotaForeground {
     if ($AllowAnyForeground) {
+        return $true
+    }
+
+    if ((Get-ForegroundProcessName) -ieq 'dota2') {
         return $true
     }
 
@@ -347,7 +370,7 @@ else {
     Write-Status "No calibration found. Using detected button center as click coordinate."
 }
 if ($StopAfterAccept) {
-    Write-Status "StopAfterAccept enabled: exiting after a click and after the button disappears."
+    Write-Status "StopAfterAccept enabled: exiting after the first detection/click."
 }
 if ($NoClick) {
     Write-Status "NoClick mode: detections will beep/log but will not click."
@@ -418,6 +441,11 @@ while ($true) {
 
             Write-Status "Accept button detected. Clicking $clickX,$clickY"
             Invoke-LeftClick -X $clickX -Y $clickY
+        }
+
+        if ($StopAfterAccept) {
+            Write-Status "StopAfterAccept complete. Exiting."
+            break
         }
     }
 

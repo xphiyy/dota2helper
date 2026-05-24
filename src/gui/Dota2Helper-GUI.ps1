@@ -7,6 +7,22 @@ using System.Runtime.InteropServices;
 
 public static class Dota2HelperWindow
 {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
 
@@ -24,6 +40,12 @@ public static class Dota2HelperWindow
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
@@ -107,6 +129,7 @@ $dotaTargetConfigPath = Join-Path $projectRoot 'config\targets\dota-default.targ
 $configPath = Join-Path $localDir 'acceptor.config.json'
 $machineCalibrationPath = Join-Path $localDir 'machine-calibration.json'
 $gameModesPath = Join-Path $localDir 'game-modes.json'
+$recorderToolsPath = Join-Path $localDir 'recorder-tools.json'
 $runtimeLogPath = Join-Path $localDir 'acceptor.runtime.log'
 $state = [ordered]@{
     Process = $null
@@ -127,6 +150,14 @@ $state = [ordered]@{
     RecorderClicks = @()
     RecorderWasMouseDown = $false
     RecorderIgnoreUntilUp = $false
+    AutoAcceptSuppressUntilDotaLeaves = $false
+    AutoAcceptStartedFromSignal = $false
+    LastForegroundWasDota = $null
+    LastForegroundProcessName = ''
+    LastForegroundTransition = 'none'
+    LastUserFocusLabel = 'mouse not checked'
+    LastUserFocusIsOverDota = $false
+    LastRecorderToolText = 'new-tool'
 }
 
 function Quote-Arg {
@@ -151,6 +182,101 @@ function Get-CreateLobbyConfigPath {
     $gameMod = if ($cmbGameMode -and -not [string]::IsNullOrWhiteSpace($cmbGameMode.Text)) { $cmbGameMode.Text } else { 'DOTA2 IM' }
     $safeGameMod = Get-SafeName $gameMod
     return Join-Path $localDir "create-lobby.$safeGameMod.config.json"
+}
+
+function Get-ForegroundProcessName {
+    $hwnd = [Dota2HelperWindow]::GetForegroundWindow()
+    if ($hwnd -eq [IntPtr]::Zero) { return '' }
+
+    $foregroundPid = [uint32]0
+    [void][Dota2HelperWindow]::GetWindowThreadProcessId($hwnd, [ref]$foregroundPid)
+    if ($foregroundPid -eq 0) { return '' }
+
+    try {
+        return ([System.Diagnostics.Process]::GetProcessById([int]$foregroundPid)).ProcessName
+    }
+    catch {
+        return ''
+    }
+}
+
+function Test-DotaForegroundProcess {
+    (Get-ForegroundProcessName) -ieq 'dota2'
+}
+
+function Get-DotaWindowHandle {
+    $processes = @()
+    try {
+        $processes = @(Get-Process -Name 'dota2' -ErrorAction SilentlyContinue)
+    }
+    catch {
+        return [IntPtr]::Zero
+    }
+
+    foreach ($process in $processes) {
+        if ($process.MainWindowHandle -ne [IntPtr]::Zero) {
+            return $process.MainWindowHandle
+        }
+    }
+
+    return [IntPtr]::Zero
+}
+
+function Get-CursorWorkingAreaStatus {
+    $point = New-Object Dota2HelperWindow+POINT
+    if (-not [Dota2HelperWindow]::GetCursorPos([ref]$point)) {
+        return [pscustomobject]@{
+            Label = 'unknown'
+            IsOverDota = $false
+        }
+    }
+
+    $hwnd = Get-DotaWindowHandle
+    if ($hwnd -eq [IntPtr]::Zero) {
+        return [pscustomobject]@{
+            Label = "mouse at $($point.X),$($point.Y), Dota window not found"
+            IsOverDota = $false
+        }
+    }
+
+    $rect = New-Object Dota2HelperWindow+RECT
+    if (-not [Dota2HelperWindow]::GetWindowRect($hwnd, [ref]$rect)) {
+        return [pscustomobject]@{
+            Label = "mouse at $($point.X),$($point.Y), Dota window bounds unknown"
+            IsOverDota = $false
+        }
+    }
+
+    $isOverDota = (
+        $point.X -ge $rect.Left -and
+        $point.X -lt $rect.Right -and
+        $point.Y -ge $rect.Top -and
+        $point.Y -lt $rect.Bottom
+    )
+    $areaLabel = if ($isOverDota) { 'over Dota' } else { 'outside Dota' }
+
+    return [pscustomobject]@{
+        Label = "mouse $areaLabel at $($point.X),$($point.Y)"
+        IsOverDota = $isOverDota
+    }
+}
+
+function Test-CursorOutsideDotaWorkingArea {
+    -not [bool]$state.LastUserFocusIsOverDota
+}
+
+function Update-ForegroundStatus {
+    param([string]$ProcessName)
+
+    if ($null -eq $lblForeground -or $lblForeground.IsDisposed) { return }
+
+    $processLabel = if ([string]::IsNullOrWhiteSpace($ProcessName)) { 'unknown' } else { $ProcessName }
+    $transitionLabel = if ([string]::IsNullOrWhiteSpace($state.LastForegroundTransition)) { 'none' } else { $state.LastForegroundTransition }
+    $lblForeground.Text = "Foreground: $processLabel, transition: $transitionLabel"
+    if ($null -ne $lblUserFocus -and -not $lblUserFocus.IsDisposed) {
+        $userFocusLabel = if ([string]::IsNullOrWhiteSpace($state.LastUserFocusLabel)) { 'mouse not checked' } else { $state.LastUserFocusLabel }
+        $lblUserFocus.Text = "User focus: $userFocusLabel"
+    }
 }
 
 function Get-SelectedGameMode {
@@ -215,6 +341,83 @@ function Save-SelectedGameMode {
     Save-GameModes -GameModes $modes
     Set-GameModeItems -Selected $mode
     Add-Log "Saved Game mod: $mode"
+    Update-ConfigurationText
+}
+
+function Get-SelectedRecorderTool {
+    if ($cmbRecorderTool -and -not [string]::IsNullOrWhiteSpace($cmbRecorderTool.Text)) {
+        return $cmbRecorderTool.Text.Trim()
+    }
+    return 'new-tool'
+}
+
+function Get-RecorderDefaultOutput {
+    param([string]$Tool)
+
+    if ([string]::IsNullOrWhiteSpace($Tool)) { $Tool = 'new-tool' }
+    $safeTool = Get-SafeName $Tool
+    return "local\$safeTool.config.json"
+}
+
+function Get-SavedRecorderTools {
+    $fallback = @('new-tool')
+    if (-not (Test-Path -LiteralPath $recorderToolsPath)) { return $fallback }
+
+    try {
+        $cfg = Get-Content -LiteralPath $recorderToolsPath -Raw | ConvertFrom-Json
+        $tools = @($cfg.recorderTools | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
+        if ($tools.Count -eq 0) { return $fallback }
+        return @($tools | Select-Object -Unique)
+    }
+    catch {
+        return $fallback
+    }
+}
+
+function Save-RecorderTools {
+    param([string[]]$RecorderTools)
+
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $recorderToolsPath))
+    [pscustomobject]@{
+        updatedAt = (Get-Date).ToString('o')
+        recorderTools = @($RecorderTools | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $recorderToolsPath -Encoding UTF8
+}
+
+function Set-RecorderToolItems {
+    param([string]$Selected)
+
+    if ($null -eq $cmbRecorderTool) { return }
+    $state.ApplyingMode = $true
+    try {
+        $tools = @(Get-SavedRecorderTools)
+        $cmbRecorderTool.Items.Clear()
+        foreach ($tool in $tools) {
+            [void]$cmbRecorderTool.Items.Add($tool)
+        }
+
+        if ([string]::IsNullOrWhiteSpace($Selected)) { $Selected = $tools[0] }
+        $cmbRecorderTool.Text = $Selected
+        $state.LastRecorderToolText = $Selected
+        if ($txtRecorderOutput) {
+            $txtRecorderOutput.Text = Get-RecorderDefaultOutput -Tool $Selected
+        }
+    }
+    finally {
+        $state.ApplyingMode = $false
+    }
+}
+
+function Save-SelectedRecorderTool {
+    $tool = Get-SelectedRecorderTool
+    $tools = @(Get-SavedRecorderTools)
+    if ($tools -notcontains $tool) {
+        $tools += $tool
+    }
+
+    Save-RecorderTools -RecorderTools $tools
+    Set-RecorderToolItems -Selected $tool
+    Add-Log "Saved recorder tool: $tool"
     Update-ConfigurationText
 }
 
@@ -347,6 +550,43 @@ function Start-HiddenWorker {
     return $proc
 }
 
+function Start-AutoAcceptWorker {
+    param(
+        [string]$Trigger = 'manual',
+        [bool]$ForceAllowAnyForeground = $false
+    )
+
+    if ($null -ne $state.Process -and -not $state.Process.HasExited) {
+        return $false
+    }
+
+    Set-Content -LiteralPath $runtimeLogPath -Value '' -Encoding UTF8
+    $state.LogOffset = 0
+
+    $argsList = @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', $workerScript,
+        '-PollMs', [string][int]$numPoll.Value,
+        '-StableHits', [string][int]$numStable.Value,
+        '-CooldownSeconds', [string][int]$numCooldown.Value,
+        '-ToolConfigPath', $autoAcceptToolConfigPath,
+        '-TargetConfigPath', $dotaTargetConfigPath,
+        '-LogPath', $runtimeLogPath
+    )
+
+    if ($chkNoClick.Checked) { $argsList += '-NoClick' }
+    if ($chkVerbose.Checked) { $argsList += '-VerboseDetection' }
+    if ($chkAnyForeground.Checked -or $ForceAllowAnyForeground) { $argsList += '-AllowAnyForeground' }
+    if ($chkStopAfter.Checked) { $argsList += '-StopAfterAccept' }
+
+    $state.Process = Start-HiddenWorker -WorkerArgs $argsList
+    $state.AutoAcceptStartedFromSignal = $Trigger -like 'dota2 foreground*'
+    Set-RunningState $true
+    Add-Log "Started Auto Accept from $Trigger, PID $($state.Process.Id)."
+    return $true
+}
+
 function Invoke-SelfFocus {
     if ($null -eq $form -or $form.IsDisposed) { return }
 
@@ -363,7 +603,7 @@ function Invoke-SelfFocus {
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Dota 2 Helper'
-$form.Size = [System.Drawing.Size]::new(620, 600)
+$form.Size = [System.Drawing.Size]::new(620, 666)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
@@ -386,7 +626,7 @@ $form.Controls.Add($cmbModule)
 
 $grpStatus = New-Object System.Windows.Forms.GroupBox
 $grpStatus.Location = [System.Drawing.Point]::new(16, 50)
-$grpStatus.Size = [System.Drawing.Size]::new(570, 88)
+$grpStatus.Size = [System.Drawing.Size]::new(570, 144)
 $grpStatus.Text = 'Status'
 $form.Controls.Add($grpStatus)
 
@@ -402,6 +642,18 @@ $lblCalibration.Size = [System.Drawing.Size]::new(530, 22)
 $lblCalibration.Text = Get-CalibrationText
 $grpStatus.Controls.Add($lblCalibration)
 
+$lblForeground = New-Object System.Windows.Forms.Label
+$lblForeground.Location = [System.Drawing.Point]::new(18, 82)
+$lblForeground.Size = [System.Drawing.Size]::new(530, 22)
+$lblForeground.Text = 'Foreground transition: none'
+$grpStatus.Controls.Add($lblForeground)
+
+$lblUserFocus = New-Object System.Windows.Forms.Label
+$lblUserFocus.Location = [System.Drawing.Point]::new(18, 110)
+$lblUserFocus.Size = [System.Drawing.Size]::new(530, 22)
+$lblUserFocus.Text = 'User focus: mouse not checked'
+$grpStatus.Controls.Add($lblUserFocus)
+
 $lblConfiguration = New-Object System.Windows.Forms.Label
 $lblConfiguration.Location = [System.Drawing.Point]::new(206, 26)
 $lblConfiguration.Size = [System.Drawing.Size]::new(342, 22)
@@ -409,7 +661,7 @@ $lblConfiguration.Text = 'Config: Ready: click once'
 $grpStatus.Controls.Add($lblConfiguration)
 
 $grpMode = New-Object System.Windows.Forms.GroupBox
-$grpMode.Location = [System.Drawing.Point]::new(16, 150)
+$grpMode.Location = [System.Drawing.Point]::new(16, 206)
 $grpMode.Size = [System.Drawing.Size]::new(570, 170)
 $grpMode.Text = 'Mode'
 $form.Controls.Add($grpMode)
@@ -486,8 +738,15 @@ $chkStopAfter = New-Object System.Windows.Forms.CheckBox
 $chkStopAfter.Location = [System.Drawing.Point]::new(4, 32)
 $chkStopAfter.Size = [System.Drawing.Size]::new(180, 24)
 $chkStopAfter.Text = 'Stop after one accept'
-$chkStopAfter.Checked = $false
+$chkStopAfter.Checked = $true
 $pnlCustomOptions.Controls.Add($chkStopAfter)
+
+$chkStartOnDotaForeground = New-Object System.Windows.Forms.CheckBox
+$chkStartOnDotaForeground.Location = [System.Drawing.Point]::new(92, 52)
+$chkStartOnDotaForeground.Size = [System.Drawing.Size]::new(220, 24)
+$chkStartOnDotaForeground.Text = 'Start when Dota foregrounds'
+$chkStartOnDotaForeground.Checked = $true
+$pnlAutoMode.Controls.Add($chkStartOnDotaForeground)
 
 $lblPoll = New-Object System.Windows.Forms.Label
 $lblPoll.Location = [System.Drawing.Point]::new(4, 62)
@@ -605,15 +864,21 @@ $lblRecorderTool.Size = [System.Drawing.Size]::new(90, 22)
 $lblRecorderTool.Text = 'Tool name'
 $pnlRecorderMode.Controls.Add($lblRecorderTool)
 
-$txtRecorderTool = New-Object System.Windows.Forms.TextBox
-$txtRecorderTool.Location = [System.Drawing.Point]::new(112, 27)
-$txtRecorderTool.Size = [System.Drawing.Size]::new(190, 24)
-$txtRecorderTool.Text = 'new-tool'
-$pnlRecorderMode.Controls.Add($txtRecorderTool)
+$cmbRecorderTool = New-Object System.Windows.Forms.ComboBox
+$cmbRecorderTool.Location = [System.Drawing.Point]::new(112, 27)
+$cmbRecorderTool.Size = [System.Drawing.Size]::new(190, 24)
+$cmbRecorderTool.DropDownStyle = 'DropDown'
+$pnlRecorderMode.Controls.Add($cmbRecorderTool)
+
+$btnSaveRecorderTool = New-Object System.Windows.Forms.Button
+$btnSaveRecorderTool.Location = [System.Drawing.Point]::new(310, 26)
+$btnSaveRecorderTool.Size = [System.Drawing.Size]::new(48, 26)
+$btnSaveRecorderTool.Text = 'Save'
+$pnlRecorderMode.Controls.Add($btnSaveRecorderTool)
 
 $lblRecorderHint = New-Object System.Windows.Forms.Label
-$lblRecorderHint.Location = [System.Drawing.Point]::new(322, 28)
-$lblRecorderHint.Size = [System.Drawing.Size]::new(224, 44)
+$lblRecorderHint.Location = [System.Drawing.Point]::new(374, 28)
+$lblRecorderHint.Size = [System.Drawing.Size]::new(172, 44)
 $lblRecorderHint.Text = 'Guided click recorder. Follow the log prompts, then click Dota positions.'
 $pnlRecorderMode.Controls.Add($lblRecorderHint)
 
@@ -636,7 +901,7 @@ $lblRecorderNote.Text = 'For now it records click operations only and writes run
 $pnlRecorderMode.Controls.Add($lblRecorderNote)
 
 $grpActions = New-Object System.Windows.Forms.GroupBox
-$grpActions.Location = [System.Drawing.Point]::new(16, 332)
+$grpActions.Location = [System.Drawing.Point]::new(16, 388)
 $grpActions.Size = [System.Drawing.Size]::new(570, 72)
 $grpActions.Text = 'Buttons'
 $form.Controls.Add($grpActions)
@@ -667,7 +932,7 @@ $btnOpenFolder.Text = 'Open folder'
 $grpActions.Controls.Add($btnOpenFolder)
 
 $grpLog = New-Object System.Windows.Forms.GroupBox
-$grpLog.Location = [System.Drawing.Point]::new(16, 416)
+$grpLog.Location = [System.Drawing.Point]::new(16, 472)
 $grpLog.Size = [System.Drawing.Size]::new(570, 128)
 $grpLog.Text = 'Log'
 $form.Controls.Add($grpLog)
@@ -704,7 +969,7 @@ function Update-ConfigurationText {
             $lblConfiguration.Text = "Config: recording $($state.RecorderTool), next click $next"
         }
         else {
-            $lblConfiguration.Text = "Config: record $($txtRecorderTool.Text) to $($txtRecorderOutput.Text)"
+            $lblConfiguration.Text = "Config: record $(Get-SelectedRecorderTool) to $($txtRecorderOutput.Text)"
         }
         return
     }
@@ -717,6 +982,7 @@ function Update-ConfigurationText {
         if ($chkNoClick.Checked) { $flags += 'detect only' }
         if ($chkVerbose.Checked) { $flags += 'verbose' }
         if ($chkAnyForeground.Checked) { $flags += 'any foreground' }
+        if ($chkStartOnDotaForeground.Checked) { $flags += 'foreground signal' }
         if ($chkStopAfter.Checked) { $flags += 'stop after accept' }
         if ($flags.Count -eq 0) { $flags += 'click mode' }
         $lblConfiguration.Text = "Config: Custom, poll $([int]$numPoll.Value)ms, hits $([int]$numStable.Value), cooldown $([int]$numCooldown.Value)s, $($flags -join ', ')"
@@ -729,6 +995,7 @@ function Update-ConfigurationText {
 function Set-CustomOptionsVisible {
     param([bool]$Visible)
     $pnlCustomOptions.Visible = $Visible
+    $chkStartOnDotaForeground.Visible = $Visible
 }
 
 function Get-CalibrationKey {
@@ -864,7 +1131,7 @@ function New-ClickStep {
 }
 
 function Get-RecorderToolName {
-    $tool = $txtRecorderTool.Text.Trim()
+    $tool = (Get-SelectedRecorderTool).Trim()
     if ([string]::IsNullOrWhiteSpace($tool)) { return 'new-tool' }
     return $tool
 }
@@ -1121,18 +1388,20 @@ function Set-AcceptMode {
                 $chkNoClick.Checked = $false
                 $chkVerbose.Checked = $false
                 $chkAnyForeground.Checked = $false
-                $chkStopAfter.Checked = $false
+                $chkStartOnDotaForeground.Checked = $true
+                $chkStopAfter.Checked = $true
                 $numPoll.Value = 450
                 $numStable.Value = 3
                 $numCooldown.Value = 15
-                $lblModeHint.Text = 'Clicks when a match is detected, then waits for the next queue.'
+                $lblModeHint.Text = 'Clicks when a match is detected, then stops.'
                 Set-CustomOptionsVisible $false
             }
             'Test: detect only' {
                 $chkNoClick.Checked = $true
                 $chkVerbose.Checked = $true
                 $chkAnyForeground.Checked = $false
-                $chkStopAfter.Checked = $false
+                $chkStartOnDotaForeground.Checked = $true
+                $chkStopAfter.Checked = $true
                 $numPoll.Value = 450
                 $numStable.Value = 3
                 $numCooldown.Value = 15
@@ -1143,7 +1412,8 @@ function Set-AcceptMode {
                 $chkNoClick.Checked = $false
                 $chkVerbose.Checked = $false
                 $chkAnyForeground.Checked = $false
-                $chkStopAfter.Checked = $false
+                $chkStartOnDotaForeground.Checked = $true
+                $chkStopAfter.Checked = $true
                 $numPoll.Value = 200
                 $numStable.Value = 2
                 $numCooldown.Value = 10
@@ -1180,6 +1450,7 @@ $markCustom = {
 $chkNoClick.Add_CheckedChanged($markCustom)
 $chkVerbose.Add_CheckedChanged($markCustom)
 $chkAnyForeground.Add_CheckedChanged($markCustom)
+$chkStartOnDotaForeground.Add_CheckedChanged($markCustom)
 $chkStopAfter.Add_CheckedChanged($markCustom)
 $numPoll.Add_ValueChanged($markCustom)
 $numStable.Add_ValueChanged($markCustom)
@@ -1206,7 +1477,26 @@ $btnSaveGameMode.Add_Click({ Save-SelectedGameMode })
 $chkLobbyDryRun.Add_CheckedChanged($markLobbyCustom)
 $numStepDelay.Add_ValueChanged($markLobbyCustom)
 
-$txtRecorderTool.Add_TextChanged({ Update-ConfigurationText })
+$cmbRecorderTool.Add_TextChanged({
+    if (-not $state.ApplyingMode) {
+        $previousDefault = Get-RecorderDefaultOutput -Tool $state.LastRecorderToolText
+        $currentTool = Get-SelectedRecorderTool
+        if ([string]::IsNullOrWhiteSpace($txtRecorderOutput.Text) -or $txtRecorderOutput.Text -eq $previousDefault) {
+            $txtRecorderOutput.Text = Get-RecorderDefaultOutput -Tool $currentTool
+        }
+        $state.LastRecorderToolText = $currentTool
+        Update-ConfigurationText
+    }
+})
+$cmbRecorderTool.Add_SelectedIndexChanged({
+    if (-not $state.ApplyingMode) {
+        $currentTool = Get-SelectedRecorderTool
+        $txtRecorderOutput.Text = Get-RecorderDefaultOutput -Tool $currentTool
+        $state.LastRecorderToolText = $currentTool
+        Update-ConfigurationText
+    }
+})
+$btnSaveRecorderTool.Add_Click({ Save-SelectedRecorderTool })
 $txtRecorderOutput.Add_TextChanged({ Update-ConfigurationText })
 
 $cmbModule.Add_SelectedIndexChanged({
@@ -1219,6 +1509,7 @@ $cmbModule.Add_SelectedIndexChanged({
 
 Set-AcceptMode -Mode 'Ready: click once'
 Set-GameModeItems -Selected 'DOTA2 IM'
+Set-RecorderToolItems -Selected 'new-tool'
 Set-LobbyMode -Mode 'Run sequence'
 Set-ActiveModule -Module 'Auto Accept'
 
@@ -1234,14 +1525,13 @@ $btnStart.Add_Click({
             return
         }
 
-        Set-Content -LiteralPath $runtimeLogPath -Value '' -Encoding UTF8
-        $state.LogOffset = 0
-
         if ([string]$cmbModule.SelectedItem -eq 'Operation Recorder') {
             Start-OperationRecorder
             return
         }
         elseif ([string]$cmbModule.SelectedItem -eq 'Create Lobby') {
+            Set-Content -LiteralPath $runtimeLogPath -Value '' -Encoding UTF8
+            $state.LogOffset = 0
             $lobbyConfigPath = Get-CreateLobbyConfigPath
             $argsList = @(
                 '-NoProfile',
@@ -1257,22 +1547,8 @@ $btnStart.Add_Click({
             if ($chkLobbyDryRun.Checked) { $argsList += '-DryRun' }
         }
         else {
-            $argsList = @(
-                '-NoProfile',
-                '-ExecutionPolicy', 'Bypass',
-                '-File', $workerScript,
-                '-PollMs', [string][int]$numPoll.Value,
-                '-StableHits', [string][int]$numStable.Value,
-                '-CooldownSeconds', [string][int]$numCooldown.Value,
-                '-ToolConfigPath', $autoAcceptToolConfigPath,
-                '-TargetConfigPath', $dotaTargetConfigPath,
-                '-LogPath', $runtimeLogPath
-            )
-
-            if ($chkNoClick.Checked) { $argsList += '-NoClick' }
-            if ($chkVerbose.Checked) { $argsList += '-VerboseDetection' }
-            if ($chkAnyForeground.Checked) { $argsList += '-AllowAnyForeground' }
-            if ($chkStopAfter.Checked) { $argsList += '-StopAfterAccept' }
+            [void](Start-AutoAcceptWorker -Trigger 'manual')
+            return
         }
 
         $state.Process = Start-HiddenWorker -WorkerArgs $argsList
@@ -1288,6 +1564,9 @@ $btnStop.Add_Click({
     if ($state.ActiveFunction -eq 'OperationRecorder') {
         Stop-OperationRecorder
         return
+    }
+    if ([string]$cmbModule.SelectedItem -eq 'Auto Accept') {
+        $state.AutoAcceptSuppressUntilDotaLeaves = $true
     }
     Stop-Worker
 })
@@ -1312,7 +1591,11 @@ $btnCalibrate.Add_Click({
             }
             if (-not (Test-Path -LiteralPath $outputPath)) {
                 [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $outputPath))
-                '{"tool":"new-tool","source":"operation-recorder","steps":[]}' | Set-Content -LiteralPath $outputPath -Encoding UTF8
+                [pscustomobject]@{
+                    tool = Get-SelectedRecorderTool
+                    source = 'operation-recorder'
+                    steps = @()
+                } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $outputPath -Encoding UTF8
             }
             Start-Process -FilePath 'notepad.exe' -ArgumentList $outputPath
             Add-Log 'Opened recorder output JSON.'
@@ -1345,6 +1628,43 @@ $timer.Add_Tick({
             }
         }
         Sync-WorkerLog
+        $foregroundProcessName = Get-ForegroundProcessName
+        $isDotaForeground = $foregroundProcessName -ieq 'dota2'
+        $state.LastForegroundProcessName = $foregroundProcessName
+
+        if ($null -eq $state.LastForegroundWasDota) {
+            $state.LastForegroundWasDota = $isDotaForeground
+        }
+        else {
+            $wasDotaForeground = [bool]$state.LastForegroundWasDota
+            $state.LastForegroundWasDota = $isDotaForeground
+
+            if ($isDotaForeground -and -not $wasDotaForeground) {
+                $state.LastForegroundTransition = 'outside -> dota2'
+                $cursorStatus = Get-CursorWorkingAreaStatus
+                $state.LastUserFocusLabel = $cursorStatus.Label
+                $state.LastUserFocusIsOverDota = [bool]$cursorStatus.IsOverDota
+                $focusIsOutsideDota = Test-CursorOutsideDotaWorkingArea
+                if ($focusIsOutsideDota -and
+                    [string]$cmbModule.SelectedItem -eq 'Auto Accept' -and
+                    $chkStartOnDotaForeground.Checked -and
+                    -not $state.AutoAcceptSuppressUntilDotaLeaves -and
+                    [string]::IsNullOrWhiteSpace($state.ActiveFunction) -and
+                    ($null -eq $state.Process -or $state.Process.HasExited)) {
+                    [void](Start-AutoAcceptWorker -Trigger 'dota2 foreground signal' -ForceAllowAnyForeground $true)
+                }
+            }
+            elseif (-not $isDotaForeground -and $wasDotaForeground) {
+                $processLabel = if ([string]::IsNullOrWhiteSpace($foregroundProcessName)) { 'outside' } else { $foregroundProcessName }
+                $state.LastForegroundTransition = "dota2 -> $processLabel"
+            }
+        }
+        Update-ForegroundStatus -ProcessName $foregroundProcessName
+
+        if (-not $isDotaForeground) {
+            $state.AutoAcceptSuppressUntilDotaLeaves = $false
+        }
+
         if ($state.ActiveFunction -eq 'Calibration') {
             $isMouseDown = (([Dota2HelperWindow]::GetAsyncKeyState([Dota2HelperWindow]::VK_LBUTTON) -band 0x8000) -ne 0)
             if (-not $isMouseDown) {
@@ -1370,6 +1690,10 @@ $timer.Add_Tick({
             Add-Log "Capture process exited with code $($state.Process.ExitCode)."
             $state.Process.Dispose()
             $state.Process = $null
+            if ($state.AutoAcceptStartedFromSignal -and $isDotaForeground) {
+                $state.AutoAcceptSuppressUntilDotaLeaves = $true
+            }
+            $state.AutoAcceptStartedFromSignal = $false
             Set-RunningState $false
         }
         $lblCalibration.Text = Get-CalibrationText
@@ -1389,6 +1713,8 @@ $form.Add_FormClosing({
     $helperMutex.Dispose()
 })
 
+Set-Content -LiteralPath $runtimeLogPath -Value '' -Encoding UTF8
+$state.LogOffset = 0
 Add-Log 'GUI ready.'
 [void]$form.ShowDialog()
 

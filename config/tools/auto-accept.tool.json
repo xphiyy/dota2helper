@@ -15,7 +15,7 @@
       "noClick": false,
       "verboseDetection": false,
       "allowAnyForeground": false,
-      "stopAfterAccept": false
+      "stopAfterAccept": true
     },
     "test": {
       "displayName": "Test: detect only",
@@ -25,7 +25,7 @@
       "noClick": true,
       "verboseDetection": true,
       "allowAnyForeground": false,
-      "stopAfterAccept": false
+      "stopAfterAccept": true
     },
     "fast": {
       "displayName": "Fast: lower delay",
@@ -35,7 +35,7 @@
       "noClick": false,
       "verboseDetection": false,
       "allowAnyForeground": false,
-      "stopAfterAccept": false
+      "stopAfterAccept": true
     }
   },
   "sequenceTemplate": {

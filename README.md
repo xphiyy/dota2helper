@@ -168,12 +168,14 @@ Auto Accept uses:
 
 Modes:
 
-- `Ready: click once`: clicks when a match is detected, then keeps waiting.
+- `Ready: click once`: clicks when a match is detected, then stops.
 - `Test: detect only`: logs and beeps without clicking.
 - `Fast: lower delay`: faster polling and fewer stable hits.
 - `Custom`: exposes tuning options.
 
 Use the **Calibrate** button from the GUI to create or update your click coordinate.
+
+The GUI can use the Windows foreground signal for queue pops. In **Custom** mode, **Start when Dota foregrounds** is visible and checked by default. When enabled, the helper watches for the foreground app moving from another app into `dota2.exe`, checks the user's mouse working area once at that transition, and starts Auto Accept only if the mouse is outside the Dota window. Clicking **Stop** suppresses auto-start until Dota leaves foreground again.
 
 ## Create Lobby
 
@@ -256,12 +258,19 @@ Generic recording flow:
 
 1. Open Dota 2 to the screen where the workflow should start.
 2. Select **Operation Recorder**.
-3. Enter a new tool name, such as `kick-player`.
-4. Set output to a new local file, such as `local\kick-player.config.json`.
-5. Click **Record**.
-6. Click each real Dota UI position in order.
-7. Click **Finish** to write the JSON.
-8. Click **Stop** to cancel without saving.
+3. Select a saved tool name from the editable dropdown, or type a new one such as `kick-player`.
+4. Click **Save** to store the new recorder tool in the local dropdown list.
+5. Set output to a new local file, such as `local\kick-player.config.json`. The default output follows the selected tool name.
+6. Click **Record**.
+7. Click each real Dota UI position in order.
+8. Click **Finish** to write the JSON.
+9. Click **Stop** to cancel without saving.
+
+Saved Operation Recorder tool names live in:
+
+```text
+local\recorder-tools.json
+```
 
 Calibration and Operation Recorder are related but different:
 
