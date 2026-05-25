@@ -3,7 +3,7 @@ param(
     [string]$ConfigPath = '',
     [string]$ToolConfigPath = '',
     [string]$ModGameName = '',
-    [int]$StepDelayMs = 450,
+    [int]$StepDelayMs = 200,
     [switch]$InitializeConfig,
     [switch]$DryRun,
     [string]$LogPath = ''

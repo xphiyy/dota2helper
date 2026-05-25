@@ -157,6 +157,45 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\AutoAcceptor-GUI.ps1
 
 Only one Dota 2 Helper instance can run at a time, and only one tool can run at a time.
 
+## Siri / iPhone Shortcuts
+
+The GUI can expose a small local network control endpoint for iPhone Shortcuts and Siri.
+
+In the GUI:
+
+1. Check **Siri support** near the tool selector.
+2. Copy the URL shown beside it with the **Copy** button, for example:
+
+```text
+http://192.168.1.20:8765/start?tool=auto-accept
+```
+
+3. On iPhone, create a Shortcut that uses **Get Contents of URL** with that URL.
+4. Name the Shortcut with the Siri phrase you want, such as `Use auto acceptor`.
+
+Supported URLs:
+
+```text
+http://YOUR_PC_IP:8765/start?tool=auto-accept
+http://YOUR_PC_IP:8765/start?tool=create-lobby
+http://YOUR_PC_IP:8765/create-lobby
+http://YOUR_PC_IP:8765/stop
+http://YOUR_PC_IP:8765/status
+```
+
+Shortcuts can use either **GET** or **POST**. For Create Lobby, the simplest POST setup is:
+
+```text
+URL: http://YOUR_PC_IP:8765/create-lobby
+Method: POST
+Headers: empty
+Body: none
+```
+
+Siri commands go through the same GUI controller as the buttons. The helper still allows only one running tool at a time. Operation Recorder is not started from Siri because it needs live manual click recording.
+
+The endpoint listens on your local network while **Siri support** is checked. Keep it off when you do not need phone control.
+
 ## Auto Accept
 
 Auto Accept uses:
@@ -185,6 +224,8 @@ Create Lobby uses:
 - Sequence runner: `src\runners\Invoke-DotaSequence.ps1`
 - Local runnable sequence per Game mod, such as `local\create-lobby.dota2-im.config.json`
 - Shared machine defaults: `local\machine-calibration.json`
+
+The default step delay for sequence actions is `200ms`. You can change it in the Create Lobby mode panel before running.
 
 The intended flow is:
 

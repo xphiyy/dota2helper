@@ -158,6 +158,9 @@ $state = [ordered]@{
     LastUserFocusLabel = 'mouse not checked'
     LastUserFocusIsOverDota = $false
     LastRecorderToolText = 'new-tool'
+    SiriListener = $null
+    SiriPort = 8765
+    SiriLastMessage = 'Siri support off'
 }
 
 function Quote-Arg {
@@ -587,6 +590,322 @@ function Start-AutoAcceptWorker {
     return $true
 }
 
+function Start-CreateLobbyWorker {
+    param([string]$Trigger = 'manual')
+
+    if ($null -ne $state.Process -and -not $state.Process.HasExited) {
+        return $false
+    }
+
+    Set-Content -LiteralPath $runtimeLogPath -Value '' -Encoding UTF8
+    $state.LogOffset = 0
+    $lobbyConfigPath = Get-CreateLobbyConfigPath
+    $argsList = @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', $sequenceScript,
+        '-Tool', 'CreateLobby',
+        '-ConfigPath', $lobbyConfigPath,
+        '-ToolConfigPath', $createLobbyToolConfigPath,
+        '-ModGameName', (Get-SelectedGameMode),
+        '-StepDelayMs', [string][int]$numStepDelay.Value,
+        '-LogPath', $runtimeLogPath
+    )
+    if ($chkLobbyDryRun.Checked) { $argsList += '-DryRun' }
+
+    $state.Process = Start-HiddenWorker -WorkerArgs $argsList
+    Set-RunningState $true
+    Add-Log "Started Create Lobby from $Trigger, PID $($state.Process.Id)."
+    return $true
+}
+
+function Get-NormalizedToolName {
+    param([string]$Tool)
+
+    $normalized = ($Tool -replace '[^a-zA-Z0-9]+', '').ToLowerInvariant()
+    switch ($normalized) {
+        { $_ -in @('autoaccept', 'autoacceptor', 'accept', 'acceptor', 'useautoacceptor') } { return 'Auto Accept' }
+        { $_ -in @('createlobby', 'lobby', 'customlobby') } { return 'Create Lobby' }
+        default { return '' }
+    }
+}
+
+function Start-ToolFromCommand {
+    param(
+        [string]$Tool,
+        [string]$Trigger = 'command'
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($state.ActiveFunction)) {
+        return "Cannot start tool while $($state.ActiveFunction) is active."
+    }
+    if ($null -ne $state.Process -and -not $state.Process.HasExited) {
+        return 'A tool is already running.'
+    }
+
+    $module = Get-NormalizedToolName -Tool $Tool
+    if ([string]::IsNullOrWhiteSpace($module)) {
+        return "Unknown tool '$Tool'. Supported: auto-accept, create-lobby."
+    }
+
+    $cmbModule.SelectedItem = $module
+    Set-ActiveModule -Module $module
+
+    if ($module -eq 'Auto Accept') {
+        if (Start-AutoAcceptWorker -Trigger $Trigger) { return 'Started Auto Accept.' }
+        return 'Auto Accept did not start.'
+    }
+    if ($module -eq 'Create Lobby') {
+        if (Start-CreateLobbyWorker -Trigger $Trigger) { return 'Started Create Lobby.' }
+        return 'Create Lobby did not start.'
+    }
+
+    return "Tool '$module' cannot be started from Siri."
+}
+
+function ConvertFrom-SiriQueryString {
+    param([string]$Query)
+
+    $values = @{}
+    if ([string]::IsNullOrWhiteSpace($Query)) { return $values }
+    $trimmed = $Query.TrimStart('?')
+    foreach ($pair in ($trimmed -split '&')) {
+        if ([string]::IsNullOrWhiteSpace($pair)) { continue }
+        $parts = $pair -split '=', 2
+        $key = [Uri]::UnescapeDataString($parts[0])
+        $value = if ($parts.Count -gt 1) { [Uri]::UnescapeDataString(($parts[1] -replace '\+', ' ')) } else { '' }
+        $values[$key] = $value
+    }
+    return $values
+}
+
+function ConvertFrom-SiriBody {
+    param(
+        [string]$Body,
+        [string]$ContentType
+    )
+
+    $values = @{}
+    if ([string]::IsNullOrWhiteSpace($Body)) { return $values }
+
+    if ($ContentType -match 'application/json') {
+        try {
+            $json = $Body | ConvertFrom-Json
+            foreach ($property in $json.PSObject.Properties) {
+                $values[$property.Name] = [string]$property.Value
+            }
+            return $values
+        }
+        catch {
+            return $values
+        }
+    }
+
+    return ConvertFrom-SiriQueryString -Query $Body
+}
+
+function Merge-SiriValues {
+    param(
+        [hashtable]$Base,
+        [hashtable]$Overrides
+    )
+
+    $merged = @{}
+    foreach ($key in $Base.Keys) { $merged[$key] = $Base[$key] }
+    foreach ($key in $Overrides.Keys) { $merged[$key] = $Overrides[$key] }
+    return $merged
+}
+
+function Send-SiriHttpResponse {
+    param(
+        [System.Net.Sockets.TcpClient]$Client,
+        [int]$StatusCode,
+        [string]$Body
+    )
+
+    $reason = if ($StatusCode -eq 200) { 'OK' } elseif ($StatusCode -eq 404) { 'Not Found' } else { 'Bad Request' }
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+    $header = "HTTP/1.1 $StatusCode $reason`r`nContent-Type: text/plain; charset=utf-8`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`n`r`n"
+    $headerBytes = [System.Text.Encoding]::ASCII.GetBytes($header)
+    $stream = $Client.GetStream()
+    $stream.Write($headerBytes, 0, $headerBytes.Length)
+    $stream.Write($bodyBytes, 0, $bodyBytes.Length)
+}
+
+function Invoke-SiriHttpRequest {
+    param([System.Net.Sockets.TcpClient]$Client)
+
+    try {
+        $Client.ReceiveTimeout = 1000
+        $buffer = New-Object byte[] 8192
+        $stream = $Client.GetStream()
+        $count = $stream.Read($buffer, 0, $buffer.Length)
+        if ($count -le 0) { return }
+
+        $request = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $count)
+        $headerEnd = $request.IndexOf("`r`n`r`n")
+        if ($headerEnd -lt 0) {
+            Send-SiriHttpResponse -Client $Client -StatusCode 400 -Body 'Invalid HTTP request.'
+            return
+        }
+
+        $headerText = $request.Substring(0, $headerEnd)
+        $body = $request.Substring($headerEnd + 4)
+        $headerLines = $headerText -split "`r?`n"
+        $firstLine = $headerLines[0]
+        if ($firstLine -notmatch '^(GET|POST)\s+(\S+)\s+HTTP/') {
+            Send-SiriHttpResponse -Client $Client -StatusCode 400 -Body 'Only GET and POST requests are supported.'
+            return
+        }
+
+        $method = $matches[1].ToUpperInvariant()
+        $requestUri = [Uri]::new("http://localhost$($matches[2])")
+        $headers = @{}
+        foreach ($line in ($headerLines | Select-Object -Skip 1)) {
+            $parts = $line -split ':', 2
+            if ($parts.Count -eq 2) { $headers[$parts[0].Trim().ToLowerInvariant()] = $parts[1].Trim() }
+        }
+
+        if ($method -eq 'POST' -and $headers.ContainsKey('content-length')) {
+            $contentLength = [int]$headers['content-length']
+            $bodyBytesAlreadyRead = [System.Text.Encoding]::ASCII.GetByteCount($body)
+            while ($bodyBytesAlreadyRead -lt $contentLength) {
+                $remainingBuffer = New-Object byte[] ([Math]::Min(4096, $contentLength - $bodyBytesAlreadyRead))
+                $read = $stream.Read($remainingBuffer, 0, $remainingBuffer.Length)
+                if ($read -le 0) { break }
+                $body += [System.Text.Encoding]::UTF8.GetString($remainingBuffer, 0, $read)
+                $bodyBytesAlreadyRead += $read
+            }
+        }
+
+        $query = ConvertFrom-SiriQueryString -Query $requestUri.Query
+        $contentType = if ($headers.ContainsKey('content-type')) { $headers['content-type'] } else { '' }
+        $bodyValues = if ($method -eq 'POST') { ConvertFrom-SiriBody -Body $body -ContentType $contentType } else { @{} }
+        $values = Merge-SiriValues -Base $query -Overrides $bodyValues
+        $path = $requestUri.AbsolutePath.TrimEnd('/').ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($path)) { $path = '/' }
+
+        switch ($path) {
+            '/start' {
+                $tool = if ($values.ContainsKey('tool')) { $values['tool'] } else { 'auto-accept' }
+                $message = Start-ToolFromCommand -Tool $tool -Trigger 'Siri'
+                $state.SiriLastMessage = $message
+                Add-Log "Siri command: $message"
+                Send-SiriHttpResponse -Client $Client -StatusCode 200 -Body $message
+            }
+            '/create-lobby' {
+                $message = Start-ToolFromCommand -Tool 'create-lobby' -Trigger 'Siri POST'
+                $state.SiriLastMessage = $message
+                Add-Log "Siri command: $message"
+                Send-SiriHttpResponse -Client $Client -StatusCode 200 -Body $message
+            }
+            '/stop' {
+                Stop-Worker
+                $message = 'Stopped current tool.'
+                $state.SiriLastMessage = $message
+                Add-Log "Siri command: $message"
+                Send-SiriHttpResponse -Client $Client -StatusCode 200 -Body $message
+            }
+            '/status' {
+                $running = ($null -ne $state.Process -and -not $state.Process.HasExited)
+                $module = if ($cmbModule.SelectedItem) { [string]$cmbModule.SelectedItem } else { 'unknown' }
+                $message = "Tool=$module; Running=$running; ActiveFunction=$($state.ActiveFunction)"
+                $state.SiriLastMessage = $message
+                Send-SiriHttpResponse -Client $Client -StatusCode 200 -Body $message
+            }
+            default {
+                Send-SiriHttpResponse -Client $Client -StatusCode 404 -Body 'Supported paths: /start?tool=auto-accept, /start?tool=create-lobby, /create-lobby, /stop, /status'
+            }
+        }
+    }
+    catch {
+        try { Send-SiriHttpResponse -Client $Client -StatusCode 400 -Body $_.Exception.Message } catch {}
+    }
+    finally {
+        $Client.Close()
+    }
+}
+
+function Get-LanAddress {
+    try {
+        $routeOutput = @(route print -4 0.0.0.0 2>$null)
+        foreach ($line in $routeOutput) {
+            if ($line -match '^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+(\d{1,3}(?:\.\d{1,3}){3})\s+(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s*$') {
+                $candidate = $matches[2]
+                if ($candidate -notmatch '^127\.' -and $candidate -notmatch '^169\.254\.' -and $candidate -notmatch '^172\.(1[6-9]|2\d|3[0-1])\.') {
+                    return $candidate
+                }
+            }
+        }
+    }
+    catch {}
+
+    try {
+        $addresses = @([System.Net.Dns]::GetHostEntry([System.Net.Dns]::GetHostName()).AddressList |
+            Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and -not [System.Net.IPAddress]::IsLoopback($_) } |
+            ForEach-Object { [string]$_ })
+
+        $preferred = @($addresses | Where-Object { $_ -match '^192\.168\.' -or $_ -match '^10\.' })
+        if ($preferred.Count -gt 0) { return $preferred[0] }
+        if ($addresses.Count -gt 0) { return $addresses[0] }
+    }
+    catch {}
+
+    return '127.0.0.1'
+}
+
+function Update-SiriStatus {
+    if ($null -eq $txtSiriStatus -or $txtSiriStatus.IsDisposed) { return }
+    if ($null -ne $state.SiriListener) {
+        $txtSiriStatus.Text = "http://$(Get-LanAddress):$($state.SiriPort)/start?tool=auto-accept"
+    }
+    else {
+        $txtSiriStatus.Text = 'Siri: off'
+    }
+}
+
+function Start-SiriSupport {
+    if ($null -ne $state.SiriListener) { return }
+
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, [int]$state.SiriPort)
+        $listener.Start()
+        $state.SiriListener = $listener
+        $state.SiriLastMessage = "Siri support listening on port $($state.SiriPort)"
+        Add-Log $state.SiriLastMessage
+    }
+    catch {
+        $state.SiriListener = $null
+        $chkSiriSupport.Checked = $false
+        Add-Log "Siri support failed: $($_.Exception.Message)"
+    }
+    Update-SiriStatus
+}
+
+function Stop-SiriSupport {
+    if ($null -eq $state.SiriListener) { return }
+    try { $state.SiriListener.Stop() } catch {}
+    $state.SiriListener = $null
+    $state.SiriLastMessage = 'Siri support off'
+    Add-Log $state.SiriLastMessage
+    Update-SiriStatus
+}
+
+function Poll-SiriSupport {
+    if ($null -eq $state.SiriListener) { return }
+    try {
+        while ($state.SiriListener.Pending()) {
+            $client = $state.SiriListener.AcceptTcpClient()
+            Invoke-SiriHttpRequest -Client $client
+        }
+    }
+    catch {
+        Add-Log "Siri support stopped: $($_.Exception.Message)"
+        Stop-SiriSupport
+        if ($chkSiriSupport) { $chkSiriSupport.Checked = $false }
+    }
+}
+
 function Invoke-SelfFocus {
     if ($null -eq $form -or $form.IsDisposed) { return }
 
@@ -623,6 +942,26 @@ $cmbModule.DropDownStyle = 'DropDownList'
 [void]$cmbModule.Items.Add('Operation Recorder')
 $cmbModule.SelectedIndex = 0
 $form.Controls.Add($cmbModule)
+
+$chkSiriSupport = New-Object System.Windows.Forms.CheckBox
+$chkSiriSupport.Location = [System.Drawing.Point]::new(330, 13)
+$chkSiriSupport.Size = [System.Drawing.Size]::new(96, 24)
+$chkSiriSupport.Text = 'Siri support'
+$chkSiriSupport.Checked = $false
+$form.Controls.Add($chkSiriSupport)
+
+$txtSiriStatus = New-Object System.Windows.Forms.TextBox
+$txtSiriStatus.Location = [System.Drawing.Point]::new(430, 13)
+$txtSiriStatus.Size = [System.Drawing.Size]::new(104, 24)
+$txtSiriStatus.ReadOnly = $true
+$txtSiriStatus.Text = 'Siri: off'
+$form.Controls.Add($txtSiriStatus)
+
+$btnCopySiriUrl = New-Object System.Windows.Forms.Button
+$btnCopySiriUrl.Location = [System.Drawing.Point]::new(540, 12)
+$btnCopySiriUrl.Size = [System.Drawing.Size]::new(46, 26)
+$btnCopySiriUrl.Text = 'Copy'
+$form.Controls.Add($btnCopySiriUrl)
 
 $grpStatus = New-Object System.Windows.Forms.GroupBox
 $grpStatus.Location = [System.Drawing.Point]::new(16, 50)
@@ -849,7 +1188,7 @@ $numStepDelay.Size = [System.Drawing.Size]::new(90, 24)
 $numStepDelay.Minimum = 50
 $numStepDelay.Maximum = 5000
 $numStepDelay.Increment = 50
-$numStepDelay.Value = 450
+$numStepDelay.Value = 200
 $pnlLobbyMode.Controls.Add($numStepDelay)
 
 $lblLobbyConfig = New-Object System.Windows.Forms.Label
@@ -1309,12 +1648,12 @@ function Set-LobbyMode {
         switch ($Mode) {
             'Run sequence' {
                 $chkLobbyDryRun.Checked = $false
-                $numStepDelay.Value = 450
+                $numStepDelay.Value = 200
                 $lblLobbyHint.Text = 'Creates or uses the local sequence config, then runs it.'
             }
             'Dry run' {
                 $chkLobbyDryRun.Checked = $true
-                $numStepDelay.Value = 450
+                $numStepDelay.Value = 200
                 $lblLobbyHint.Text = 'Logs each configured step without clicking or typing.'
             }
             default {
@@ -1499,6 +1838,30 @@ $cmbRecorderTool.Add_SelectedIndexChanged({
 $btnSaveRecorderTool.Add_Click({ Save-SelectedRecorderTool })
 $txtRecorderOutput.Add_TextChanged({ Update-ConfigurationText })
 
+$chkSiriSupport.Add_CheckedChanged({
+    if ($chkSiriSupport.Checked) {
+        Start-SiriSupport
+    }
+    else {
+        Stop-SiriSupport
+    }
+})
+
+$btnCopySiriUrl.Add_Click({
+    try {
+        $value = $txtSiriStatus.Text
+        if ([string]::IsNullOrWhiteSpace($value) -or $value -eq 'Siri: off') {
+            Add-Log 'Siri URL is not available. Enable Siri support first.'
+            return
+        }
+        [System.Windows.Forms.Clipboard]::SetText($value)
+        Add-Log "Copied Siri URL: $value"
+    }
+    catch {
+        Add-Log "Copy Siri URL failed: $($_.Exception.Message)"
+    }
+})
+
 $cmbModule.Add_SelectedIndexChanged({
     if ($cmbModule.SelectedItem) {
         $state.ActiveFunction = ''
@@ -1530,30 +1893,13 @@ $btnStart.Add_Click({
             return
         }
         elseif ([string]$cmbModule.SelectedItem -eq 'Create Lobby') {
-            Set-Content -LiteralPath $runtimeLogPath -Value '' -Encoding UTF8
-            $state.LogOffset = 0
-            $lobbyConfigPath = Get-CreateLobbyConfigPath
-            $argsList = @(
-                '-NoProfile',
-                '-ExecutionPolicy', 'Bypass',
-                '-File', $sequenceScript,
-                '-Tool', 'CreateLobby',
-                '-ConfigPath', $lobbyConfigPath,
-                '-ToolConfigPath', $createLobbyToolConfigPath,
-                '-ModGameName', (Get-SelectedGameMode),
-                '-StepDelayMs', [string][int]$numStepDelay.Value,
-                '-LogPath', $runtimeLogPath
-            )
-            if ($chkLobbyDryRun.Checked) { $argsList += '-DryRun' }
+            [void](Start-CreateLobbyWorker -Trigger 'manual')
+            return
         }
         else {
             [void](Start-AutoAcceptWorker -Trigger 'manual')
             return
         }
-
-        $state.Process = Start-HiddenWorker -WorkerArgs $argsList
-        Set-RunningState $true
-        Add-Log "Started hidden tool process, PID $($state.Process.Id)."
     }
     catch {
         Add-Log "Start failed: $($_.Exception.Message)"
@@ -1628,6 +1974,7 @@ $timer.Add_Tick({
             }
         }
         Sync-WorkerLog
+        Poll-SiriSupport
         $foregroundProcessName = Get-ForegroundProcessName
         $isDotaForeground = $foregroundProcessName -ieq 'dota2'
         $state.LastForegroundProcessName = $foregroundProcessName
@@ -1707,6 +2054,7 @@ $timer.Start()
 $form.Add_FormClosing({
     $state.Closing = $true
     $timer.Stop()
+    Stop-SiriSupport
     Stop-Worker
     $timer.Dispose()
     try { $helperMutex.ReleaseMutex() } catch {}
